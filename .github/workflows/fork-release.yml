@@ -1,0 +1,120 @@
+# Binary release workflow for forks.
+#
+# Builds the `codex` CLI binary for macOS (ARM64 + Intel) and Windows (x64)
+# using standard GitHub-hosted runners — no private runners or code-signing
+# credentials are required.
+#
+# To trigger a release, push a semver tag:
+#   git tag -a v0.1.0 -m "Release 0.1.0"
+#   git push origin v0.1.0
+#
+# You can also trigger a build-only run (no release created) via the
+# "Run workflow" button in the Actions tab.
+
+name: fork-release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+# Cargo's libgit2 transport has been flaky when fetching git dependencies with
+# nested submodules. Prefer the system git CLI across every Cargo invocation.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: codex-rs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon (ARM64)
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          # macOS Intel (x86_64)
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          # Windows x86_64
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      # Expose the MSVC developer environment so cargo can find the linker and
+      # Windows SDK headers. Only needed on Windows builds.
+      - name: Configure MSVC environment
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build codex binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          # Disable SQLite intrinsics on x86_64 MSVC to work around an MSVC
+          # code-generation issue with the bundled SQLite.
+          if [[ "$target" == "x86_64-pc-windows-msvc" ]]; then
+            export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          fi
+          cargo build --target "$target" --release --bin codex
+
+      - name: Stage release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          dest="dist"
+          mkdir -p "$dest"
+          if [[ "$target" == *"windows"* ]]; then
+            cp "target/${target}/release/codex.exe" "$dest/codex-${target}.exe"
+          else
+            cp "target/${target}/release/codex" "$dest/codex-${target}"
+            # Also provide a compressed archive for easy download.
+            tar -C "$dest" -czf "$dest/codex-${target}.tar.gz" "codex-${target}"
+          fi
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-${{ matrix.target }}
+          path: codex-rs/dist/*
+          if-no-files-found: error
+
+  release:
+    # Only publish a GitHub Release when triggered by a version tag.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          files: artifacts/*
+          draft: false
+          generate_release_notes: true
